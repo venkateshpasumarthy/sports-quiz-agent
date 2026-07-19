@@ -1,165 +1,211 @@
 """
-app.py
-------
-Streamlit dashboard for the AI-Powered Sports Quiz Generation Agent.
+AI-Powered Automated HR Support Chatbot (Beginner Version)
+------------------------------------------------------------
+Stack: Python + Streamlit + LangChain + FAISS + Gemini API
 
-This is a UI layer only -- all the actual agent logic (ChromaDB retrieval,
-web search, LLM generation, JSON validation) lives in backend/quiz_agent.py
-and is untouched/reused here.
+How it works (RAG = Retrieval Augmented Generation):
+1. The HR policy document (data/hr_policies.txt) is split into small chunks.
+2. Each chunk is converted into a vector embedding using Gemini's embedding model.
+3. All embeddings are stored in a FAISS vector index for fast similarity search.
+4. When an employee asks a question, we embed the question, find the most
+   relevant policy chunks (the "context"), and pass them + the question to
+   the Gemini chat model so it can answer using only that context.
 
 Run with:
     streamlit run app.py
 """
+
+import os
 import streamlit as st
+from dotenv import load_dotenv
 
-from backend.config import SUPPORTED_SPORTS, DIFFICULTY_LEVELS
-from backend.quiz_agent import generate_quiz
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
-st.set_page_config(page_title="Quiz Board — Sports Quiz Agent", page_icon="🏆", layout="centered")
+# ----------------------------------------------------------------------
+# 1. Basic setup
+# ----------------------------------------------------------------------
+load_dotenv()  # reads GOOGLE_API_KEY from a local .env file, if present
 
-# ---------------------------------------------------------------------------
-# Minimal styling to match the scoreboard theme (optional, purely cosmetic)
-# ---------------------------------------------------------------------------
-st.markdown("""
-<style>
-    .stApp { background-color: #0B3D2E; }
-    h1, h2, h3, p, label, .stMarkdown { color: #F5F3EA !important; }
-    .stButton>button {
-        background-color: #FFB627;
-        color: #14201C;
-        font-weight: 700;
-        border-radius: 4px;
-        border: none;
-    }
-    .stButton>button:hover { background-color: #ffc95c; color: #14201C; }
-    div[data-testid="stMetricValue"] { color: #FFB627; }
-</style>
-""", unsafe_allow_html=True)
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# ---------------------------------------------------------------------------
-# Session state
-# ---------------------------------------------------------------------------
-if "quiz_data" not in st.session_state:
-    st.session_state.quiz_data = None
-if "answers" not in st.session_state:
-    st.session_state.answers = {}  # {question_index: chosen_letter}
-if "previous_questions" not in st.session_state:
-    st.session_state.previous_questions = []
+DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "hr_policies.txt")
+INDEX_PATH = os.path.join(os.path.dirname(__file__), "faiss_index")
 
-# ---------------------------------------------------------------------------
-# Header
-# ---------------------------------------------------------------------------
-st.markdown("<p style='color:#FFB627; letter-spacing:0.3em; font-size:12px; text-transform:uppercase;'>AI Agent · RAG + Web Search</p>", unsafe_allow_html=True)
-st.title("🏆 Quiz Board")
-st.caption("Pick a sport and difficulty. Answer each question to reveal if you're right.")
+# Model names (Gemini, as of 2026). You can change these later — see README.
+CHAT_MODEL = "gemini-2.5-flash"          # fast + cheap, good for Q&A
+EMBEDDING_MODEL = "gemini-embedding-001"  # stable text embedding model
 
-# ---------------------------------------------------------------------------
-# Controls
-# ---------------------------------------------------------------------------
-col1, col2, col3 = st.columns([2, 2, 1])
-with col1:
-    sport = st.selectbox("Sport", SUPPORTED_SPORTS)
-with col2:
-    difficulty = st.selectbox("Difficulty", DIFFICULTY_LEVELS, index=1)
-with col3:
-    num_questions = st.selectbox("Questions", [4, 5], index=1)
+st.set_page_config(page_title="HR Support Chatbot", page_icon="🤖", layout="centered")
 
-gen_col, regen_col = st.columns(2)
-generate_clicked = gen_col.button("Generate Quiz", use_container_width=True)
-regenerate_clicked = regen_col.button(
-    "Regenerate", use_container_width=True,
-    disabled=st.session_state.quiz_data is None,
-)
-
-
-def run_generation(avoid: bool):
-    with st.spinner("Fetching facts from ChromaDB + web search, then writing questions…"):
-        try:
-            avoid_list = st.session_state.previous_questions if avoid else None
-            data = generate_quiz(
-                sport=sport,
-                difficulty=difficulty,
-                num_questions=num_questions,
-                avoid_questions=avoid_list,
-            )
-            st.session_state.quiz_data = data
-            st.session_state.answers = {}
-            st.session_state.previous_questions = [q["question"] for q in data["questions"]]
-        except Exception as e:
-            st.error(f"Couldn't generate quiz: {e}")
-
-
-if generate_clicked:
-    run_generation(avoid=False)
-if regenerate_clicked:
-    run_generation(avoid=True)
-
-# ---------------------------------------------------------------------------
-# Quiz display
-# ---------------------------------------------------------------------------
-data = st.session_state.quiz_data
-
-if data:
-    sources = data["sources"]
-    st.caption(
-        f"Grounded on {sources['vector_db_facts_used']} ChromaDB fact(s) "
-        f"+ {sources['web_facts_used']} live web result(s)"
+# ----------------------------------------------------------------------
+# 2. Build (or load) the FAISS vector store — cached so it only runs once
+# ----------------------------------------------------------------------
+@st.cache_resource(show_spinner="Setting up the knowledge base...")
+def get_vectorstore():
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model=EMBEDDING_MODEL,
+        google_api_key=GOOGLE_API_KEY,
     )
+
+    # Reuse a previously built index if it exists, so we don't re-embed
+    # the document (and burn API quota) every time the app restarts.
+    if os.path.exists(INDEX_PATH):
+        return FAISS.load_local(
+            INDEX_PATH, embeddings, allow_dangerous_deserialization=True
+        )
+
+    loader = TextLoader(DATA_PATH, encoding="utf-8")
+    raw_documents = loader.load()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=600,
+        chunk_overlap=80,
+        separators=["\n\n", "\n", ". ", " "],
+    )
+    chunks = splitter.split_documents(raw_documents)
+
+    vectorstore = FAISS.from_documents(chunks, embeddings)
+    vectorstore.save_local(INDEX_PATH)
+    return vectorstore
+
+
+# ----------------------------------------------------------------------
+# 3. Build the LLM + prompt template — also cached
+# ----------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def get_llm_and_prompt():
+    llm = ChatGoogleGenerativeAI(
+        model=CHAT_MODEL,
+        google_api_key=GOOGLE_API_KEY,
+        temperature=0.2,
+    )
+
+    prompt = ChatPromptTemplate.from_template(
+        """You are a friendly, professional HR Support Assistant for this company.
+Answer the employee's question using ONLY the HR policy context provided below.
+If the context does not contain the answer, say you don't have that information
+and suggest the employee contact the HR team directly. Keep answers concise and
+easy to read.
+
+HR Policy Context:
+{context}
+
+Employee Question:
+{question}
+
+Answer:"""
+    )
+
+    return llm, prompt
+
+
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
+
+
+def answer_question(question: str, vectorstore, llm, prompt):
+    """Retrieve relevant policy chunks, then ask Gemini to answer using them."""
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    retrieved_docs = retriever.invoke(question)
+    context = format_docs(retrieved_docs)
+
+    chain = prompt | llm | StrOutputParser()
+    answer = chain.invoke({"context": context, "question": question})
+    return answer, retrieved_docs
+
+
+# ----------------------------------------------------------------------
+# 4. Streamlit UI
+# ----------------------------------------------------------------------
+st.title("🤖 AI-Powered HR Support Chatbot")
+st.caption("Ask me about leave, payroll, benefits, work-from-home policy, and more.")
+
+if not GOOGLE_API_KEY:
+    st.error(
+        "⚠️ No Gemini API key found. Create a `.env` file (see `.env.example`) "
+        "with `GOOGLE_API_KEY=your_key_here`, then restart the app."
+    )
+    st.stop()
+
+vectorstore = get_vectorstore()
+llm, prompt = get_llm_and_prompt()
+
+if "messages" not in st.session_state:
+    st.session_state.messages = [
+        {
+            "role": "assistant",
+            "content": "Hi! I'm your HR assistant. Ask me anything about company "
+            "policies — leave, payroll, benefits, work hours, and more.",
+        }
+    ]
+
+# Render chat history
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if msg.get("sources"):
+            with st.expander("📄 Sources used for this answer"):
+                for i, doc in enumerate(msg["sources"], start=1):
+                    st.markdown(f"**Snippet {i}:** {doc}")
+
+# Chat input
+user_input = st.chat_input("Type your HR question here...")
+
+if user_input:
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Checking the HR handbook..."):
+            try:
+                answer, sources = answer_question(user_input, vectorstore, llm, prompt)
+            except Exception as e:
+                answer = (
+                    "Sorry, something went wrong while contacting the AI model. "
+                    f"Details: {e}"
+                )
+                sources = []
+        st.markdown(answer)
+        if sources:
+            with st.expander("📄 Sources used for this answer"):
+                for i, doc in enumerate(sources, start=1):
+                    st.markdown(f"**Snippet {i}:** {doc.page_content}")
+
+    st.session_state.messages.append(
+        {
+            "role": "assistant",
+            "content": answer,
+            "sources": [d.page_content for d in sources] if sources else [],
+        }
+    )
+
+# ----------------------------------------------------------------------
+# 5. Sidebar
+# ----------------------------------------------------------------------
+with st.sidebar:
+    st.header("About")
+    st.write(
+        "This chatbot answers HR questions using Retrieval Augmented Generation "
+        "(RAG): it searches the company's HR policy document for relevant "
+        "passages with FAISS, then asks Google's Gemini model to answer based "
+        "only on those passages."
+    )
+    st.markdown(f"**Chat model:** `{CHAT_MODEL}`")
+    st.markdown(f"**Embedding model:** `{EMBEDDING_MODEL}`")
+
     st.divider()
+    if st.button("🗑️ Clear chat history"):
+        st.session_state.messages = []
+        st.rerun()
 
-    questions = data["questions"]
-    letters = ["A", "B", "C", "D"]
-
-    for i, q in enumerate(questions):
-        st.subheader(f"{i + 1:02d}. {q['question']}")
-
-        answered = i in st.session_state.answers
-
-        if not answered:
-            choice = st.radio(
-                "Pick an answer",
-                letters,
-                format_func=lambda L, q=q: f"{L}. {q['options'][L]}",
-                key=f"radio_{i}_{q['question']}",
-                index=None,
-                label_visibility="collapsed",
-            )
-            if st.button("Submit answer", key=f"submit_{i}_{q['question']}"):
-                if choice is None:
-                    st.warning("Pick an option first.")
-                else:
-                    st.session_state.answers[i] = choice
-                    st.rerun()
-        else:
-            picked = st.session_state.answers[i]
-            correct = q["correct_answer"]
-            for L in letters:
-                label = f"{L}. {q['options'][L]}"
-                if L == correct:
-                    st.success(label + ("  ✅ Correct" if L == picked else "  ← Correct answer"))
-                elif L == picked:
-                    st.error(label + "  ❌ Your pick")
-                else:
-                    st.markdown(f"<span style='opacity:0.5'>{label}</span>", unsafe_allow_html=True)
-            st.info(f"**Why:** {q['explanation']}")
-
-        st.divider()
-
-    answered_count = len(st.session_state.answers)
-    if answered_count == len(questions):
-        correct_count = sum(
-            1 for i, q in enumerate(questions)
-            if st.session_state.answers[i] == q["correct_answer"]
-        )
-        st.markdown(
-            f"<h3 style='text-align:center; color:#FFB627;'>You scored {correct_count} / {len(questions)}</h3>",
-            unsafe_allow_html=True,
-        )
-else:
-    st.info("Pick a sport and difficulty above, then click **Generate Quiz** to get started.")
-
-st.markdown(
-    "<p style='text-align:center; opacity:0.4; font-size:12px; margin-top:32px;'>"
-    "Sports Quiz Generation Agent · ChromaDB retrieval + live web search + Gemini/OpenAI</p>",
-    unsafe_allow_html=True,
-)
+    st.divider()
+    st.caption(
+        "Tip: edit `data/hr_policies.txt` with your own company's policies, "
+        "then delete the `faiss_index` folder so it gets rebuilt."
+    )
